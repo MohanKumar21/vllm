@@ -149,39 +149,59 @@ The Realtime API provides WebSocket-based streaming audio transcription, allowin
 !!! note
     To use the Realtime API, please install with extra audio dependencies using `uv pip install vllm[audio]`.
 
+The endpoint implements the transcription subset of the
+[OpenAI Realtime API](https://platform.openai.com/docs/guides/realtime-transcription),
+using the official `openai.types.realtime` event schemas.
+
 ### Audio Format
 
-Audio must be sent as base64-encoded PCM16 audio at 16kHz sample rate, mono channel.
+Audio must be sent as base64-encoded PCM16 mono audio. The sample rate defaults
+to 24kHz and can be set to 16000, 24000 or 48000 via
+`session.audio.input.format.rate`; the server resamples to the model rate.
 
 ### Protocol Overview
 
 1. Client connects to `ws://host/v1/realtime`
-2. Server sends `session.created` event
-3. Client optionally sends `session.update` with model/params
-4. Client sends `input_audio_buffer.commit` when ready
-5. Client sends `input_audio_buffer.append` events with base64 PCM16 chunks
-6. Server sends `transcription.delta` events with incremental text
-7. Server sends `transcription.done` with final text + usage
-8. Repeat from step 5 for next utterance
-9. Optionally, client sends input_audio_buffer.commit with final=True
-    to signal audio input is finished. Useful when streaming audio files
+2. Server sends `session.created`
+3. Client sends `session.update` with the session config (audio format,
+   transcription model); server acks with `session.updated`
+4. Client streams `input_audio_buffer.append` events with base64 PCM16 chunks;
+   server emits `conversation.item.input_audio_transcription.delta` events as
+   text is generated
+5. Client sends `input_audio_buffer.commit` to end the utterance; server emits
+   `input_audio_buffer.committed`, `conversation.item.created`, then
+   `conversation.item.input_audio_transcription.completed` with the final
+   transcript and usage
+6. Repeat from step 4 for the next utterance; `input_audio_buffer.clear`
+   abandons the current utterance
+
+!!! note
+    Transcription deltas are emitted while audio is still being appended,
+    before the commit. They reference the item id that the subsequent
+    `input_audio_buffer.committed` event announces. This deviates from
+    OpenAI's commit-only delta emission so streaming realtime models keep
+    their latency advantage.
 
 ### Client → Server Events
 
 | Event | Description |
 | ----- | ----------- |
+| `session.update` | Configure session: `{"type": "session.update", "session": {"type": "transcription", "audio": {"input": {"format": {"type": "audio/pcm", "rate": 16000}, "transcription": {"model": "model-name"}}}}}` |
 | `input_audio_buffer.append` | Send base64-encoded audio chunk: `{"type": "input_audio_buffer.append", "audio": "<base64>"}` |
-| `input_audio_buffer.commit` | Trigger transcription processing or end: `{"type": "input_audio_buffer.commit", "final": bool}` |
-| `session.update` | Configure session: `{"type": "session.update", "model": "model-name"}` |
+| `input_audio_buffer.commit` | End the current utterance and finalize its transcription |
+| `input_audio_buffer.clear` | Abandon the current utterance without transcribing it |
 
 ### Server → Client Events
 
 | Event | Description |
 | ----- | ----------- |
-| `session.created` | Connection established with session ID and timestamp |
-| `transcription.delta` | Incremental transcription text: `{"type": "transcription.delta", "delta": "text"}` |
-| `transcription.done` | Final transcription with usage stats |
-| `error` | Error notification with message and optional code |
+| `session.created` / `session.updated` | Session lifecycle, carrying the session config |
+| `input_audio_buffer.committed` | Commit ack, announces the utterance's `item_id` |
+| `conversation.item.created` | The committed utterance as a conversation item |
+| `conversation.item.input_audio_transcription.delta` | Incremental transcription text for an item |
+| `conversation.item.input_audio_transcription.completed` | Final transcript for an item, with token usage |
+| `conversation.item.input_audio_transcription.failed` | Transcription of a committed item failed |
+| `error` | Structured error: `{"type": "error", "error": {"type", "code", "message", "param", "event_id"}}` |
 
 #### Example Clients
 

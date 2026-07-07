@@ -3,7 +3,6 @@
 
 import asyncio
 import json
-import warnings
 
 import numpy as np
 import pybase64 as base64
@@ -33,12 +32,32 @@ MISTRAL_FORMAT_ARGS = [
 
 MODEL_NAME = "mistralai/Voxtral-Mini-4B-Realtime-2602"
 
+DELTA_EVENT = "conversation.item.input_audio_transcription.delta"
+COMPLETED_EVENT = "conversation.item.input_audio_transcription.completed"
+FAILED_EVENT = "conversation.item.input_audio_transcription.failed"
+
 
 def _get_websocket_url(server: RemoteOpenAIServer) -> str:
     """Convert HTTP URL to WebSocket URL for realtime endpoint."""
     http_url = server.url_root
     ws_url = http_url.replace("http://", "ws://")
     return f"{ws_url}/v1/realtime"
+
+
+def _session_update(model: str) -> dict:
+    """OpenAI Realtime transcription session config for 16 kHz PCM."""
+    return {
+        "type": "session.update",
+        "session": {
+            "type": "transcription",
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": 16000},
+                    "transcription": {"model": model},
+                }
+            },
+        },
+    }
 
 
 async def receive_event(ws, timeout: float = 60.0) -> dict:
@@ -50,6 +69,18 @@ async def receive_event(ws, timeout: float = 60.0) -> dict:
 async def send_event(ws, event: dict) -> None:
     """Send JSON event to WebSocket."""
     await ws.send(json.dumps(event))
+
+
+async def configure_session(ws, model: str) -> None:
+    """Open a session: consume session.created, send session.update,
+    wait for session.updated."""
+    event = await receive_event(ws, timeout=30.0)
+    assert event["type"] == "session.created"
+
+    await send_event(ws, _session_update(model))
+
+    event = await receive_event(ws, timeout=10.0)
+    assert event["type"] == "session.updated", event
 
 
 @pytest.fixture
@@ -88,29 +119,10 @@ async def test_multi_chunk_streaming(
     ) as remote_server:
         ws_url = _get_websocket_url(remote_server)
         async with websockets.connect(ws_url) as ws:
-            # Receive session.created
-            event = await receive_event(ws, timeout=30.0)
-            assert event["type"] == "session.created"
+            await configure_session(ws, model_name)
 
-            await send_event(ws, {"type": "session.update", "model": model_name})
-
-            # Wait for the server to acknowledge the session update.
-            try:
-                while True:
-                    event = await receive_event(ws, timeout=5.0)
-                    if event["type"] == "session.updated":
-                        break
-            except TimeoutError:
-                warnings.warn(
-                    f"session.updated not received within {5.0}s after "
-                    "session.update. The server may not implement this event.",
-                    stacklevel=2,
-                )
-
-            # (ROCm) Warm-up: send a non-final commit (required to start
-            # transcription) with a small audio chunk to trigger aiter
-            # compilation on first use.
-            await send_event(ws, {"type": "input_audio_buffer.commit"})
+            # (ROCm) Warm-up: transcribe a small utterance to trigger
+            # aiter compilation on first use.
             await send_event(
                 ws,
                 {
@@ -118,46 +130,49 @@ async def test_multi_chunk_streaming(
                     "audio": mary_had_lamb_audio_chunks[0],
                 },
             )
-            await send_event(ws, {"type": "input_audio_buffer.commit", "final": True})
+            await send_event(ws, {"type": "input_audio_buffer.commit"})
 
             # (ROCm) Drain all warm-up responses with generous timeout for
             # JIT compilation
-            warmup_done = False
-            while not warmup_done:
+            while True:
                 event = await receive_event(ws, timeout=600.0)
-                if event["type"] in ("transcription.done", "error"):
-                    warmup_done = True
+                if event["type"] in (COMPLETED_EVENT, FAILED_EVENT, "error"):
+                    break
 
             # Now send the real test audio
-            await send_event(ws, {"type": "input_audio_buffer.commit"})
-
-            # Send multiple audio chunks
             for chunk in mary_had_lamb_audio_chunks:
                 await send_event(
                     ws, {"type": "input_audio_buffer.append", "audio": chunk}
                 )
 
-            # Send commit to end
-            await send_event(ws, {"type": "input_audio_buffer.commit", "final": True})
+            # Commit to end the utterance
+            await send_event(ws, {"type": "input_audio_buffer.commit"})
 
-            # Collect transcription deltas
+            # Collect committed / created / deltas / completed
             full_text = ""
+            committed_item_id = None
             done_received = False
 
             while not done_received:
                 event = await receive_event(ws, timeout=60.0)
 
-                if event["type"] == "transcription.delta":
+                if event["type"] == "input_audio_buffer.committed":
+                    committed_item_id = event["item_id"]
+                elif event["type"] == "conversation.item.created":
+                    assert event["item"]["id"] == committed_item_id
+                elif event["type"] == DELTA_EVENT:
                     full_text += event["delta"]
-                elif event["type"] == "transcription.done":
+                elif event["type"] == COMPLETED_EVENT:
                     done_received = True
-                    assert "text" in event
-                elif event["type"] == "error":
+                    assert "transcript" in event
+                elif event["type"] in (FAILED_EVENT, "error"):
                     pytest.fail(f"Received error: {event}")
 
             # Verify transcription contains expected content
-            assert event["type"] == "transcription.done"
-            assert event["text"] == full_text
+            assert event["type"] == COMPLETED_EVENT
+            assert event["item_id"] == committed_item_id
+            assert event["transcript"] == full_text
+            assert event["usage"]["type"] == "tokens"
             assert full_text == (
                 " First words I spoke in the original phonograph."
                 " A little piece of practical poetry. Mary had a little lamb,"
@@ -182,7 +197,7 @@ async def test_empty_commit_does_not_crash_engine(
     An empty commit (no prior input_audio_buffer.append) used to trigger
     ``AssertionError: For realtime you must provide a multimodal_embedding
     at every step`` which killed the entire engine process, disconnecting
-    every connected client.
+    every connected client. It is now rejected before reaching the engine.
     """
     server_args = ["--enforce-eager", "--max-model-len", "2048"]
 
@@ -198,75 +213,34 @@ async def test_empty_commit_does_not_crash_engine(
 
         # --- First connection: empty commit (no audio appended) ----------
         async with websockets.connect(ws_url) as ws:
-            event = await receive_event(ws, timeout=30.0)
-            assert event["type"] == "session.created"
+            await configure_session(ws, model_name)
 
-            await send_event(ws, {"type": "session.update", "model": model_name})
-
-            try:
-                while True:
-                    event = await receive_event(ws, timeout=5.0)
-                    if event["type"] == "session.updated":
-                        break
-            except TimeoutError:
-                warnings.warn(
-                    f"session.updated not received within {5.0}s after "
-                    "session.update. The server may not implement this event.",
-                    stacklevel=2,
-                )
-
-            # Start generation without sending any audio
+            # Commit without sending any audio
             await send_event(ws, {"type": "input_audio_buffer.commit"})
 
-            # Immediately signal end-of-audio
-            await send_event(ws, {"type": "input_audio_buffer.commit", "final": True})
-
-            # We should get *some* response (error or empty transcription),
-            # but the engine must NOT crash.
-            # (ROCm) Use generous timeout for first request (aiter JIT compilation)
-            event = await receive_event(ws, timeout=360.0)
-            assert event["type"] in (
-                "error",
-                "transcription.done",
-                "transcription.delta",
-            )
+            event = await receive_event(ws, timeout=30.0)
+            assert event["type"] == "error"
+            assert event["error"]["code"] == "invalid_state"
 
         # --- Second connection: normal transcription ---------------------
         # Verifies the engine is still alive after the empty commit above.
         async with websockets.connect(ws_url) as ws:
-            event = await receive_event(ws, timeout=30.0)
-            assert event["type"] == "session.created"
-
-            await send_event(ws, {"type": "session.update", "model": model_name})
-
-            try:
-                while True:
-                    event = await receive_event(ws, timeout=5.0)
-                    if event["type"] == "session.updated":
-                        break
-            except TimeoutError:
-                warnings.warn(
-                    f"session.updated not received within {5.0}s after "
-                    "session.update. The server may not implement this event.",
-                    stacklevel=2,
-                )
-
-            # Start transcription
-            await send_event(ws, {"type": "input_audio_buffer.commit"})
+            await configure_session(ws, model_name)
 
             for chunk in mary_had_lamb_audio_chunks:
                 await send_event(
                     ws, {"type": "input_audio_buffer.append", "audio": chunk}
                 )
 
-            await send_event(ws, {"type": "input_audio_buffer.commit", "final": True})
+            await send_event(ws, {"type": "input_audio_buffer.commit"})
 
             done_received = False
             while not done_received:
-                event = await receive_event(ws, timeout=60.0)
-                if event["type"] == "transcription.done":
+                # (ROCm) Generous timeout for first-request JIT compilation
+                event = await receive_event(ws, timeout=600.0)
+                if event["type"] == COMPLETED_EVENT:
                     done_received = True
-                elif event["type"] == "error":
+                elif event["type"] in (FAILED_EVENT, "error"):
                     pytest.fail(f"Engine error after empty commit: {event}")
             assert done_received
 
@@ -293,14 +267,13 @@ async def test_session_update_invalid_model_returns_error(
             assert event["type"] == "session.created"
 
             # Send session.update with a model that doesn't exist
-            await send_event(
-                ws,
-                {"type": "session.update", "model": "nonexistent-model"},
-            )
+            await send_event(ws, _session_update("nonexistent-model"))
 
             event = await receive_event(ws, timeout=10.0)
             assert event["type"] == "error"
-            assert "nonexistent-model" in event["error"]
+            assert event["error"]["code"] == "model_not_found"
+            assert "nonexistent-model" in event["error"]["message"]
+            assert event["error"]["param"] == "session.audio.input.transcription.model"
 
 
 @pytest.mark.asyncio
@@ -308,8 +281,8 @@ async def test_session_update_invalid_model_returns_error(
 async def test_commit_without_session_update_returns_error(
     model_name, rocm_aiter_fa_attention
 ):
-    """Test that committing before validating the model returns an error
-    and does not fall through to processing."""
+    """Test that committing before configuring the session returns an
+    error and does not fall through to processing."""
     server_args = ["--enforce-eager", "--max-model-len", "2048"]
 
     if model_name.startswith("mistralai"):
@@ -326,11 +299,39 @@ async def test_commit_without_session_update_returns_error(
             assert event["type"] == "session.created"
 
             # Send commit without sending session.update first
-            await send_event(
-                ws,
-                {"type": "input_audio_buffer.commit", "final": True},
-            )
+            await send_event(ws, {"type": "input_audio_buffer.commit"})
 
             event = await receive_event(ws, timeout=10.0)
             assert event["type"] == "error"
-            assert "model_not_validated" in event.get("code", "")
+            assert event["error"]["code"] == "invalid_state"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+async def test_turn_detection_rejected(model_name, rocm_aiter_fa_attention):
+    """Test that requesting server-side VAD returns a structured error."""
+    server_args = ["--enforce-eager", "--max-model-len", "2048"]
+
+    if model_name.startswith("mistralai"):
+        server_args += MISTRAL_FORMAT_ARGS
+
+    add_attention_backend(server_args, rocm_aiter_fa_attention)
+
+    with RemoteOpenAIServer(
+        model_name, server_args, env_dict=REALTIME_ENV_OVERRIDES
+    ) as remote_server:
+        ws_url = _get_websocket_url(remote_server)
+        async with websockets.connect(ws_url) as ws:
+            event = await receive_event(ws, timeout=30.0)
+            assert event["type"] == "session.created"
+
+            update = _session_update(model_name)
+            update["session"]["audio"]["input"]["turn_detection"] = {
+                "type": "server_vad"
+            }
+            await send_event(ws, update)
+
+            event = await receive_event(ws, timeout=10.0)
+            assert event["type"] == "error"
+            assert event["error"]["code"] == "not_supported"
+            assert event["error"]["param"] == "session.audio.input.turn_detection"

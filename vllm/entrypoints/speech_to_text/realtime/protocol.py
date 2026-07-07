@@ -1,68 +1,68 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Wire schema for the /v1/realtime WebSocket.
 
-import time
+Implements the transcription subset of the OpenAI Realtime API using the
+official ``openai.types.realtime`` models, subclassed only where the SDK
+pins fields to OpenAI-hosted values (audio rate, model names).
+"""
+
 from typing import Literal
 
-from pydantic import Field
-
-from vllm.entrypoints.openai.engine.protocol import (
-    OpenAIBaseModel,
-    UsageInfo,
+from openai.types.realtime import SessionCreatedEvent as _SessionCreatedEvent
+from openai.types.realtime import SessionUpdatedEvent as _SessionUpdatedEvent
+from openai.types.realtime import SessionUpdateEvent as _SessionUpdateEvent
+from openai.types.realtime.realtime_audio_formats import AudioPCM as _AudioPCM
+from openai.types.realtime.realtime_transcription_session_audio import (
+    RealtimeTranscriptionSessionAudio as _TranscriptionSessionAudio,
 )
-from vllm.utils import random_uuid
+from openai.types.realtime.realtime_transcription_session_audio_input import (
+    RealtimeTranscriptionSessionAudioInput as _TranscriptionSessionAudioInput,
+)
+from openai.types.realtime.realtime_transcription_session_create_request import (
+    RealtimeTranscriptionSessionCreateRequest as _TranscriptionSessionCreateRequest,
+)
 
-# Client -> Server Events
+# Sample rate the realtime models consume; appended audio is resampled
+# to this rate before it reaches the engine.
+MODEL_SAMPLE_RATE = 16000
 
+# Fallback when the client omits `audio.input.format.rate`. Matches the
+# OpenAI Realtime default (the SDK pins `AudioPCM.rate` to Literal[24000]).
+DEFAULT_INPUT_SAMPLE_RATE = 24000
 
-class InputAudioBufferAppend(OpenAIBaseModel):
-    """Append audio chunk to buffer"""
-
-    type: Literal["input_audio_buffer.append"] = "input_audio_buffer.append"
-    audio: str  # base64-encoded PCM16 @ 16kHz
-
-
-class InputAudioBufferCommit(OpenAIBaseModel):
-    """Process accumulated audio buffer"""
-
-    type: Literal["input_audio_buffer.commit"] = "input_audio_buffer.commit"
-    final: bool = False
-
-
-# Server -> Client Events
-class SessionUpdate(OpenAIBaseModel):
-    """Configure session parameters"""
-
-    type: Literal["session.update"] = "session.update"
-    model: str | None = None
+# Wire rates accepted on `audio.input.format.rate`; anything else is
+# rejected. Non-model rates are resampled server-side.
+SUPPORTED_INPUT_SAMPLE_RATES = (16000, 24000, 48000)
 
 
-class SessionCreated(OpenAIBaseModel):
-    """Connection established notification"""
+class AudioPCM(_AudioPCM):
+    """`audio/pcm` input format with the SDK's Literal[24000] rate pin
+    relaxed so common ASR client rates can be validated server-side."""
 
-    type: Literal["session.created"] = "session.created"
-    id: str = Field(default_factory=lambda: f"sess-{random_uuid()}")
-    created: int = Field(default_factory=lambda: int(time.time()))
-
-
-class TranscriptionDelta(OpenAIBaseModel):
-    """Incremental transcription text"""
-
-    type: Literal["transcription.delta"] = "transcription.delta"
-    delta: str  # Incremental text
+    type: Literal["audio/pcm"] = "audio/pcm"
+    rate: int | None = None
 
 
-class TranscriptionDone(OpenAIBaseModel):
-    """Final transcription with usage stats"""
-
-    type: Literal["transcription.done"] = "transcription.done"
-    text: str  # Complete transcription
-    usage: UsageInfo | None = None
+class TranscriptionSessionAudioInput(_TranscriptionSessionAudioInput):
+    format: AudioPCM | None = None
 
 
-class ErrorEvent(OpenAIBaseModel):
-    """Error notification"""
+class TranscriptionSessionAudio(_TranscriptionSessionAudio):
+    input: TranscriptionSessionAudioInput | None = None
 
-    type: Literal["error"] = "error"
-    error: str
-    code: str | None = None
+
+class TranscriptionSessionConfig(_TranscriptionSessionCreateRequest):
+    audio: TranscriptionSessionAudio | None = None
+
+
+class SessionUpdateEvent(_SessionUpdateEvent):
+    session: TranscriptionSessionConfig
+
+
+class SessionCreatedEvent(_SessionCreatedEvent):
+    session: TranscriptionSessionConfig
+
+
+class SessionUpdatedEvent(_SessionUpdatedEvent):
+    session: TranscriptionSessionConfig

@@ -45,11 +45,28 @@ async def websocket_handler():
         # Wait for session.created
         await ws.recv()
 
-        # Validate model
-        await ws.send(json.dumps({"type": "session.update", "model": model}))
-
-        # Signal ready
-        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        # Configure the session: audio format + transcription model
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "type": "transcription",
+                        "audio": {
+                            "input": {
+                                "format": {
+                                    "type": "audio/pcm",
+                                    "rate": SAMPLE_RATE,
+                                },
+                                "transcription": {"model": model},
+                            }
+                        },
+                    },
+                }
+            )
+        )
+        # Wait for session.updated
+        await ws.recv()
 
         async def send_audio():
             while is_running:
@@ -67,9 +84,10 @@ async def websocket_handler():
 
         async def receive_transcription():
             global transcription_text
+            delta_type = "conversation.item.input_audio_transcription.delta"
             async for message in ws:
                 data = json.loads(message)
-                if data.get("type") == "transcription.delta":
+                if data.get("type") == delta_type:
                     transcription_text += data["delta"]
 
         await asyncio.gather(send_audio(), receive_transcription())

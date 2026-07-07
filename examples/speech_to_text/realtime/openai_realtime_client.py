@@ -55,16 +55,32 @@ async def realtime_transcribe(audio_path: str, host: str, port: int, model: str)
         # Wait for session.created
         response = json.loads(await ws.recv())
         if response["type"] == "session.created":
-            print(f"Session created: {response['id']}")
+            print(f"Session created: {response['session']['id']}")
         else:
             print(f"Unexpected response: {response}")
             return
 
-        # Validate model
-        await ws.send(json.dumps({"type": "session.update", "model": model}))
-
-        # Signal ready to start
-        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        # Configure the session: audio format + transcription model
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "type": "transcription",
+                        "audio": {
+                            "input": {
+                                "format": {"type": "audio/pcm", "rate": 16000},
+                                "transcription": {"model": model},
+                            }
+                        },
+                    },
+                }
+            )
+        )
+        response = json.loads(await ws.recv())
+        if response["type"] != "session.updated":
+            print(f"Unexpected response: {response}")
+            return
 
         # Convert audio file to base64 PCM16
         print(f"Loading audio from: {audio_path}")
@@ -87,22 +103,23 @@ async def realtime_transcribe(audio_path: str, host: str, port: int, model: str)
                 )
             )
 
-        # Signal all audio is sent
-        await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
+        # Commit to end the utterance and finalize the transcription
+        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
         print("Audio sent. Waiting for transcription...\n")
 
         # Receive transcription
         print("Transcription: ", end="", flush=True)
         while True:
             response = json.loads(await ws.recv())
-            if response["type"] == "transcription.delta":
+            rtype = response["type"]
+            if rtype == "conversation.item.input_audio_transcription.delta":
                 print(response["delta"], end="", flush=True)
-            elif response["type"] == "transcription.done":
-                print(f"\n\nFinal transcription: {response['text']}")
+            elif rtype == "conversation.item.input_audio_transcription.completed":
+                print(f"\n\nFinal transcription: {response['transcript']}")
                 if response.get("usage"):
                     print(f"Usage: {response['usage']}")
                 break
-            elif response["type"] == "error":
+            elif rtype == "error":
                 print(f"\nError: {response['error']}")
                 break
 
